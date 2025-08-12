@@ -137,6 +137,7 @@ install_packages() {
         iptables-persistent \
         shadowsocks-libev \
         python3 \
+        python3-pip \
         python3-socks \
         python3-requests \
         curl \
@@ -149,6 +150,10 @@ install_packages() {
         lsof \
         psmisc \
         netstat-nat
+    
+    # Ensure Python dependencies are available
+    print_status "Installing additional Python dependencies..."
+    pip3 install pysocks requests 2>/dev/null || python3 -m pip install pysocks requests 2>/dev/null || true
         
     # Stop any conflicting services
     systemctl stop wpa_supplicant 2>/dev/null || true
@@ -215,21 +220,86 @@ EOF
 setup_http_proxy() {
     print_status "Creating HTTP proxy..."
     
+    # Ensure Python socks module is available
+    print_status "Installing Python dependencies..."
+    pip3 install pysocks 2>/dev/null || python3 -m pip install pysocks 2>/dev/null || true
+    
     cat > /opt/shadowmadow-proxy.py << 'EOF'
 #!/usr/bin/env python3
 """
 ShadowMadow HTTP Proxy - Converts SOCKS5 to HTTP
+Improved version with better error handling
 """
 import socket
 import threading
-import socks
 import time
+import sys
+import signal
+import logging
+import os
+
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    handlers=[
+        logging.FileHandler('/var/log/shadowmadow-proxy.log'),
+        logging.StreamHandler(sys.stdout)
+    ]
+)
+
+try:
+    import socks
+    logging.info("socks module imported successfully")
+except ImportError as e:
+    logging.error(f"Failed to import socks module: {e}")
+    logging.error("Trying alternative import...")
+    try:
+        import socket as socks
+        # Fallback mode without SOCKS proxy
+        USE_SOCKS = False
+        logging.warning("Using fallback mode without SOCKS proxy")
+    except:
+        logging.error("Complete failure to import socket modules")
+        sys.exit(1)
+else:
+    USE_SOCKS = True
 
 class HTTPProxy:
     def __init__(self, local_port=8080, socks_host='127.0.0.1', socks_port=1080):
         self.local_port = local_port
         self.socks_host = socks_host
         self.socks_port = socks_port
+        self.running = True
+        self.server = None
+        
+        # Set up signal handlers
+        signal.signal(signal.SIGTERM, self.signal_handler)
+        signal.signal(signal.SIGINT, self.signal_handler)
+        
+    def signal_handler(self, signum, frame):
+        logging.info(f"Received signal {signum}, shutting down...")
+        self.running = False
+        if self.server:
+            self.server.close()
+        
+    def test_socks_connection(self):
+        """Test if SOCKS5 proxy is available"""
+        if not USE_SOCKS:
+            logging.warning("SOCKS not available, using direct connection")
+            return False
+        try:
+            test_socket = socks.socksocket()
+            test_socket.set_proxy(socks.SOCKS5, self.socks_host, self.socks_port)
+            test_socket.settimeout(5)
+            # Try to connect to a known service through SOCKS
+            test_socket.connect(("8.8.8.8", 53))
+            test_socket.close()
+            logging.info("SOCKS5 proxy connection test successful")
+            return True
+        except Exception as e:
+            logging.warning(f"SOCKS5 proxy test failed: {e}")
+            return False
         
     def handle_client(self, client_socket):
         try:
@@ -262,15 +332,25 @@ class HTTPProxy:
                     port = 443
                     
                 try:
-                    remote_socket = socks.socksocket()
-                    remote_socket.set_proxy(socks.SOCKS5, self.socks_host, self.socks_port)
+                    if USE_SOCKS and self.test_socks_connection():
+                        remote_socket = socks.socksocket()
+                        remote_socket.set_proxy(socks.SOCKS5, self.socks_host, self.socks_port)
+                        remote_socket.settimeout(30)
+                    else:
+                        remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        remote_socket.settimeout(30)
+                    
                     remote_socket.connect((host, port))
                     
                     client_socket.send(b'HTTP/1.1 200 Connection Established\r\n\r\n')
                     self.tunnel_data(client_socket, remote_socket)
                     
                 except Exception as e:
-                    client_socket.send(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                    logging.warning(f"CONNECT tunnel failed for {host}:{port} - {e}")
+                    try:
+                        client_socket.send(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                    except:
+                        pass
                     
             else:
                 # HTTP request
@@ -288,27 +368,44 @@ class HTTPProxy:
                         break
                 
                 if not host:
-                    client_socket.send(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                    try:
+                        client_socket.send(b'HTTP/1.1 400 Bad Request\r\n\r\n')
+                    except:
+                        pass
                     return
                 
                 try:
-                    remote_socket = socks.socksocket()
-                    remote_socket.set_proxy(socks.SOCKS5, self.socks_host, self.socks_port)
-                    remote_socket.connect((host, port))
+                    if USE_SOCKS and self.test_socks_connection():
+                        remote_socket = socks.socksocket()
+                        remote_socket.set_proxy(socks.SOCKS5, self.socks_host, self.socks_port)
+                        remote_socket.settimeout(30)
+                    else:
+                        remote_socket = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+                        remote_socket.settimeout(30)
                     
+                    remote_socket.connect((host, port))
                     remote_socket.send(request)
                     
-                    while True:
-                        data = remote_socket.recv(4096)
-                        if not data:
+                    while self.running:
+                        try:
+                            data = remote_socket.recv(4096)
+                            if not data:
+                                break
+                            client_socket.send(data)
+                        except socket.timeout:
                             break
-                        client_socket.send(data)
+                        except:
+                            break
                         
                 except Exception as e:
-                    client_socket.send(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                    logging.warning(f"HTTP request failed for {host}:{port} - {e}")
+                    try:
+                        client_socket.send(b'HTTP/1.1 502 Bad Gateway\r\n\r\n')
+                    except:
+                        pass
                     
         except Exception as e:
-            pass
+            logging.warning(f"Client handling error: {e}")
         finally:
             try:
                 client_socket.close()
@@ -316,91 +413,115 @@ class HTTPProxy:
                 pass
     
     def tunnel_data(self, client_socket, remote_socket):
-        def forward(src, dst):
+        def forward(src, dst, name):
             try:
-                while True:
-                    data = src.recv(4096)
-                    if not data:
+                while self.running:
+                    try:
+                        data = src.recv(4096)
+                        if not data:
+                            break
+                        dst.send(data)
+                    except socket.timeout:
+                        continue
+                    except:
                         break
-                    dst.send(data)
-            except:
-                pass
+            except Exception as e:
+                logging.debug(f"Tunnel {name} error: {e}")
                 
-        t1 = threading.Thread(target=forward, args=(client_socket, remote_socket))
-        t2 = threading.Thread(target=forward, args=(remote_socket, client_socket))
+        t1 = threading.Thread(target=forward, args=(client_socket, remote_socket, "client->remote"))
+        t2 = threading.Thread(target=forward, args=(remote_socket, client_socket, "remote->client"))
         
         t1.daemon = True
         t2.daemon = True
         t1.start()
         t2.start()
-        t1.join()
-        t2.join()
+        t1.join(timeout=300)  # 5 minute timeout
+        t2.join(timeout=300)
     
-    def start(self):
-        # Kill any existing processes using our port
-        import os
+    def cleanup_port(self):
+        """Clean up any processes using our port"""
         import subprocess
         try:
-            # Kill any existing python processes using this port
-            subprocess.run(["pkill", "-f", "shadowmadow-proxy"], stderr=subprocess.DEVNULL)
-            time.sleep(1)
-            
-            # Kill any processes using port 8080
-            result = subprocess.run(["lsof", "-ti:8080"], capture_output=True, text=True)
+            # Kill any existing processes using our port
+            result = subprocess.run(["lsof", "-ti", f":{self.local_port}"], 
+                                  capture_output=True, text=True, timeout=5)
             if result.stdout.strip():
                 pids = result.stdout.strip().split('\n')
                 for pid in pids:
                     try:
-                        subprocess.run(["kill", "-9", pid], stderr=subprocess.DEVNULL)
+                        logging.info(f"Killing process {pid} using port {self.local_port}")
+                        subprocess.run(["kill", "-9", pid], timeout=5)
                     except:
                         pass
-            time.sleep(1)
-        except:
-            pass
-            
-        server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEPORT, 1)
+                time.sleep(2)
+        except Exception as e:
+            logging.debug(f"Port cleanup error: {e}")
+    
+    def start(self):
+        logging.info("ShadowMadow HTTP Proxy starting...")
+        
+        # Test SOCKS connection first
+        socks_available = self.test_socks_connection()
+        if not socks_available:
+            logging.warning("SOCKS5 proxy not available, will try direct connections")
+        
+        # Clean up port
+        self.cleanup_port()
+        
+        self.server = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+        self.server.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
         
         # Try to bind with retries
-        max_retries = 5
+        max_retries = 10
         for attempt in range(max_retries):
             try:
-                server.bind(('0.0.0.0', self.local_port))
+                self.server.bind(('0.0.0.0', self.local_port))
                 break
             except OSError as e:
                 if e.errno == 98 and attempt < max_retries - 1:  # Address already in use
-                    print(f"Port {self.local_port} in use, retrying in {attempt + 1} seconds...")
+                    logging.warning(f"Port {self.local_port} in use, retrying in {attempt + 1} seconds...")
                     time.sleep(attempt + 1)
-                    # Try to kill any process using the port
-                    import os
-                    os.system(f"lsof -ti:{self.local_port} | xargs -r kill -9 2>/dev/null || true")
+                    self.cleanup_port()
                     continue
                 else:
+                    logging.error(f"Failed to bind to port {self.local_port}: {e}")
                     raise
         
         try:
-            server.listen(50)
-            print(f"ShadowMadow HTTP Proxy listening on port {self.local_port}")
+            self.server.listen(50)
+            self.server.settimeout(1.0)  # Allow periodic checking of self.running
+            logging.info(f"ShadowMadow HTTP Proxy listening on port {self.local_port}")
             
-            while True:
+            while self.running:
                 try:
-                    client_socket, addr = server.accept()
+                    client_socket, addr = self.server.accept()
                     client_thread = threading.Thread(target=self.handle_client, args=(client_socket,))
                     client_thread.daemon = True
                     client_thread.start()
+                except socket.timeout:
+                    continue  # Check if we should still be running
                 except Exception as e:
-                    print(f"Accept error: {e}")
-                    time.sleep(1)
+                    if self.running:
+                        logging.error(f"Accept error: {e}")
+                        time.sleep(1)
                         
         except Exception as e:
-            print(f"Server error: {e}")
+            logging.error(f"Server error: {e}")
+            raise
         finally:
-            server.close()
+            logging.info("Closing proxy server...")
+            if self.server:
+                self.server.close()
 
 if __name__ == '__main__':
-    proxy = HTTPProxy()
-    proxy.start()
+    try:
+        proxy = HTTPProxy()
+        proxy.start()
+    except KeyboardInterrupt:
+        logging.info("Proxy stopped by user")
+    except Exception as e:
+        logging.error(f"Proxy failed: {e}")
+        sys.exit(1)
 EOF
 
     chmod +x /opt/shadowmadow-proxy.py
@@ -532,20 +653,22 @@ EOF
 Description=ShadowMadow HTTP Proxy
 After=shadowmadow-client.service network.target
 Wants=shadowmadow-client.service
-Requires=shadowmadow-client.service
 
 [Service]
 Type=simple
 User=root
-ExecStartPre=/bin/sleep 3
+ExecStartPre=/bin/sleep 5
 ExecStart=/usr/bin/python3 /opt/shadowmadow-proxy.py
 Restart=always
-RestartSec=10
-StartLimitInterval=60
-StartLimitBurst=3
+RestartSec=15
+StartLimitInterval=120
+StartLimitBurst=5
 KillMode=mixed
 KillSignal=SIGTERM
-TimeoutStopSec=10
+TimeoutStopSec=15
+StandardOutput=journal
+StandardError=journal
+Environment=PYTHONUNBUFFERED=1
 
 [Install]
 WantedBy=multi-user.target
@@ -900,16 +1023,53 @@ start_services() {
     fi
     
     print_status "Starting HTTP proxy..."
+    
+    # Ensure Python dependencies are installed before starting
+    print_status "Verifying Python dependencies..."
+    python3 -c "import socks" 2>/dev/null || {
+        print_status "Installing missing socks module..."
+        pip3 install pysocks || python3 -m pip install pysocks || apt install -y python3-socks
+    }
+    
+    # Test the proxy script manually first
+    print_status "Testing proxy script..."
+    timeout 3 python3 /opt/shadowmadow-proxy.py &
+    PID=$!
+    sleep 1
+    if kill -0 $PID 2>/dev/null; then
+        print_success "Proxy script test successful"
+        kill $PID 2>/dev/null || true
+    else
+        print_error "Proxy script test failed"
+        # Check for obvious issues
+        python3 -c "import socks, socket, threading, sys, signal, logging, os; print('All imports successful')" || {
+            print_error "Python import test failed"
+            pip3 install pysocks requests
+        }
+    fi
+    
     systemctl start shadowmadow-proxy
-    sleep 3
+    sleep 5
     
     if ! systemctl is-active --quiet shadowmadow-proxy; then
         print_error "HTTP proxy failed to start, checking logs..."
         journalctl -u shadowmadow-proxy --no-pager -n 10
-        # Try restarting with delay
+        
+        # Try manual debugging
+        print_status "Attempting manual proxy test..."
+        timeout 5 python3 /opt/shadowmadow-proxy.py &
+        MANUAL_PID=$!
         sleep 2
-        systemctl restart shadowmadow-proxy
-        sleep 3
+        if kill -0 $MANUAL_PID 2>/dev/null; then
+            print_status "Manual proxy works, trying service restart..."
+            kill $MANUAL_PID 2>/dev/null || true
+            sleep 2
+            systemctl restart shadowmadow-proxy
+            sleep 5
+        else
+            print_error "Manual proxy test also failed"
+            kill $MANUAL_PID 2>/dev/null || true
+        fi
     fi
     
     print_status "Starting hostapd..."
